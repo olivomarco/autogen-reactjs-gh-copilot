@@ -1,0 +1,11 @@
+langchain
+langchain-core
+openai
+langchain-openai
+azure-ai-generative
+python-dotenv
+langchain-community
+unstructured
+autogen
+flaml[automl]
+flask
