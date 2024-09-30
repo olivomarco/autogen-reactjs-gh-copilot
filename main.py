@@ -1,24 +1,17 @@
 import autogen
 import os, sys
 import glob
-from autogen import ConversableAgent, register_function
-from typing import Annotated, Literal
+from autogen import register_function
 from flask import Flask, request, Response
 import time
 import json
 from pydantic import BaseModel
 from typing import Union, Optional
-import base64
-import requests
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.hazmat.primitives.serialization import load_pem_public_key
+from verify_signatures import verify_request_by_key_id
 
-
-class ReactComponentList(BaseModel):
-    components: list[str]
-
-
+###########################
+# SAMPLE CODE
+###########################
 html_code = """
 <!doctype html>
 <html lang="en">
@@ -166,88 +159,24 @@ html_code = """
 </html>
 """
 
+###########################
+# GLOBAL VARIABLES
+###########################
 BASE_FOLDER = "custom_library_src"
-
 
 endObject = {
     "choices": [{ "index": 0, "finish_reason": "stop", "delta": { "content": None } }]
 }
+
+###########################
+# DEFINE METHODS TO GENERATE RESPONSE
+###########################
 def generate(llm_response):
     #for word in llm_response.split():
         #yield f'data: {{"choices": [{{ "index": 0, "delta": {{ "content": {json.dumps(word)}, "role": "assistant" }} }}]}}\n\n'
         #time.sleep(0.1)
     yield f'data: {{"choices": [{{ "index": 0, "delta": {{ "content": {json.dumps(llm_response)}, "role": "assistant" }} }}]}}\n\n'
     yield f"data: {json.dumps(endObject)}\n\ndata: [DONE]\n\n"
-
-
-def verify_request(raw_body, signature, public_key_pem):
-    """Verify the request payload with the provided public key and signature"""
-    try:
-        # Decode the signature from base64
-        signature = base64.b64decode(signature)
-
-        # Load the public key
-        public_key = load_pem_public_key(public_key_pem.encode())
-
-        # Verify the signature based on key type
-        if isinstance(public_key, ec.EllipticCurvePublicKey):
-            # EC key verification
-            public_key.verify(
-                signature,
-                raw_body.encode(),
-                ec.ECDSA(hashes.SHA256())
-            )
-        else:
-            raise ValueError("Unsupported key type")
-
-        return True
-    except Exception as e:
-        print(f"Verification failed: {e}")
-        return False
-
-
-def fetch_verification_keys(token=""):
-    """Fetch the public keys from GitHub"""
-    headers = {}
-    if token:
-        headers['Authorization'] = f"token {token}"
-
-    response = requests.get("https://api.github.com/meta/public_keys/copilot_api", headers=headers)
-
-    if response.status_code == 200:
-        # Parse the response and return the keys
-        return response.json().get('public_keys', [])
-    else:
-        raise Exception(f"Failed to fetch keys: {response.status_code}")
-
-
-def verify_request_by_key_id(raw_body, signature, key_id, token=""):
-    """Fetch the public key matching the key identifier and verify the request"""
-    # Fetch all public keys
-    public_keys = fetch_verification_keys(token)
-
-    # Find the matching key by key_id
-    public_key = next((key for key in public_keys if key["key_identifier"] == key_id), None)
-
-    if not public_key:
-        raise Exception(f"No public key found matching key identifier: {key_id}")
-
-    # Verify the request using the matching public key
-    public_key_pem = public_key['key']
-    is_valid = verify_request(raw_body, signature, public_key_pem)
-
-    return is_valid
-
-
-
-# Capture the last message from code_writer_assistant before TERMINATE
-def get_final_code_writer_message(messages):
-    for message in reversed(messages):
-        # Check if the message is from code_writer_assistant and it's not TERMINATE
-        if message.get("name", "") == "code_writer_assistant":
-            # remove "TERMINATE" from the message and return it
-            return message.get("content", "").replace("TERMINATE", "").strip()
-    return None
 
 
 # Capture the last message from response_writer_assistant before TERMINATE
@@ -262,6 +191,12 @@ def get_final_response_writer_message(messages):
             return message.get("content", "").replace("TERMINATE", "").strip()
     return None
 
+
+###########################
+# DEFINE THE TOOLS
+###########################
+class ReactComponentList(BaseModel):
+    components: list[str]
 
 def get_react_components_list() -> Union[str, ReactComponentList]:
     # retrieve list of all reactjs components
@@ -282,65 +217,9 @@ def get_react_component(component_name: str) -> Optional[str]:
     with open(f"{BASE_FOLDER}/{component_name}/{component_name}.js", "r") as file:
         return file.read()
 
-
-config_list = autogen.config_list_from_json(env_or_file="OAI_CONFIG_LIST")
-llm_config = {"config_list": config_list}
-
-code_writer_assistant = autogen.ConversableAgent(
-    name="code_writer_assistant",
-    llm_config=llm_config,
-    system_message="You are an assistant that analyzes HTML code and creates a new ReactJS app that renders the HTML code."
-                    "First, call get_react_components_list() to get the list of all custom ReactJS components you are allowed to use that are provided by the 'custom_abc' ReactJS components library."
-                    "Then, call get_react_component(component_name) to get the code for a specific component you want to use to analyze it, and see if it is the right component to use in your context."
-                    "Finally, output the code for the new ReactJS app you created using these components, along with CSS if needed. Format in Markdown format with code (HTML, CSS, JSX, others) that is idented with a tab."
-                    "Reply \"TERMINATE\" in the end when everything is done."
-)
-
-code_reviewer_assistant = autogen.ConversableAgent(
-    name="code_reviewer_assistant",
-    llm_config=llm_config,
-    system_message="You are an assistant that reviews the code written by the code_writer_assistant."
-                    "You should analyze the code and provide feedback to the assistant on how to improve it. Remember that the provided 'custom_abc' library must be used by the code writer assistant for the components."
-                    "Make sure components included by code_writer_assistant are not hallucinated."
-                    "You can also suggest changes to the code if necessary, taking in consideration that the output ReactJS code (and CSS if provided) must render exactly as the input HTML code."
-                    "Only reply 'TERMINATE' if the code that the code_writer_assistant provides is fully satisfactory after your feedback and corrections have been implemented."
-)
-
-response_writer_assistant = autogen.ConversableAgent(
-    name="response_writer_assistant",
-    llm_config=llm_config,
-    system_message="Develop a response using code provided by code_writer_assistant once it has been reviewed and approved by code_reviewer_assistant. Your response will go in a chat with a user."
-                    "Do not address the user directly. Start naturally, and do not show that you are a bot. Do not respond with input code again, just with output code that "
-                    "the user needs to develop the React component and with instructions. Format in Markdown format with code (HTML, CSS, JSX, others) that is idented with a tab."
-                    "Reply \"TERMINATE\" in the end when everything is done."
-)
-
-register_function(
-    get_react_components_list,
-    caller=code_writer_assistant,  # The assistant agent can suggest calls to the calculator.
-    executor=code_writer_assistant,  # The user proxy agent can execute the calculator calls.
-    name="get_react_components_list",  # By default, the function name is used as the tool name.
-    description="Get the list of custom ReactJS components",  # A description of the tool.
-)
-
-register_function(
-    get_react_component,
-    caller=code_writer_assistant,  # The assistant agent can suggest calls to the calculator.
-    executor=code_writer_assistant,  # The user proxy agent can execute the calculator calls.
-    name="get_react_component",  # By default, the function name is used as the tool name.
-    description="Get the JS contents of a given ReactJS component you need to investigate",  # A description of the tool.
-)
-
-user = autogen.UserProxyAgent(
-    name="User",
-    human_input_mode="NEVER",
-    is_termination_msg=lambda x: x.get("content", "") and x.get("content", "").rstrip().endswith("TERMINATE"),
-    code_execution_config=False,
-)
-
-groupchat = autogen.GroupChat(agents=[user, code_writer_assistant, code_reviewer_assistant, response_writer_assistant], messages=[], max_round=10)
-manager = autogen.GroupChatManager(groupchat=groupchat, llm_config=llm_config)
-
+###########################
+# FLASK APP
+###########################
 def create_app():
     app = Flask(__name__)
 
@@ -378,19 +257,72 @@ def create_app():
         )
 
         # get final message from code_writer_assistant
-        final_code_writer_message = get_final_code_writer_message(groupchat.messages)
         final_response_writer_message = get_final_response_writer_message(groupchat.messages)
-        #print("Final code from code_writer_assistant to be shown in UI:\n\n", final_code_writer_message)
-        #print("Final code from response_writer_assistant to be shown in UI:\n\n", final_response_writer_message)
-        # add the request body from the request url to the final message
-        #final_code_writer_message += "\n\nRequest body:\n" + str(request.args)
-        # add the request headers from the request url to the final message
-        #final_code_writer_message += "\n\nRequest headers:\n" + str(request.headers)
-        #return final_code_writer_message
         return Response(generate(final_response_writer_message), mimetype='text/event-stream')
 
     return app
 
+###########################
+# MAIN CODE
+###########################
 if __name__ == "__main__":
-    app = create_app()
-    app.run(debug=True)
+  config_list = autogen.config_list_from_json(env_or_file="OAI_CONFIG_LIST")
+  llm_config = {"config_list": config_list}
+
+  code_writer_assistant = autogen.ConversableAgent(
+      name="code_writer_assistant",
+      llm_config=llm_config,
+      system_message="You are an assistant that analyzes HTML code and creates a new ReactJS app that renders the HTML code."
+                      "First, call get_react_components_list() to get the list of all custom ReactJS components you are allowed to use that are provided by the 'custom_abc' ReactJS components library."
+                      "Then, call get_react_component(component_name) to get the code for a specific component you want to use to analyze it, and see if it is the right component to use in your context."
+                      "Finally, output the code for the new ReactJS app you created using these components, along with CSS if needed. Format in Markdown format with code (HTML, CSS, JSX, others) that is idented with a tab."
+                      "Reply \"TERMINATE\" in the end when everything is done."
+  )
+
+  code_reviewer_assistant = autogen.ConversableAgent(
+      name="code_reviewer_assistant",
+      llm_config=llm_config,
+      system_message="You are an assistant that reviews the code written by the code_writer_assistant."
+                      "You should analyze the code and provide feedback to the assistant on how to improve it. Remember that the provided 'custom_abc' library must be used by the code writer assistant for the components."
+                      "Make sure components included by code_writer_assistant are not hallucinated."
+                      "You can also suggest changes to the code if necessary, taking in consideration that the output ReactJS code (and CSS if provided) must render exactly as the input HTML code."
+                      "Only reply 'TERMINATE' if the code that the code_writer_assistant provides is fully satisfactory after your feedback and corrections have been implemented."
+  )
+
+  response_writer_assistant = autogen.ConversableAgent(
+      name="response_writer_assistant",
+      llm_config=llm_config,
+      system_message="Develop a response using code provided by code_writer_assistant once it has been reviewed and approved by code_reviewer_assistant. Your response will go in a chat with a user."
+                      "Do not address the user directly. Start naturally, and do not show that you are a bot. Do not respond with input code again, just with output code that "
+                      "the user needs to develop the React component and with instructions. Format in Markdown format with code (HTML, CSS, JSX, others) that is idented with a tab."
+                      "Reply \"TERMINATE\" in the end when everything is done."
+  )
+
+  register_function(
+      get_react_components_list,
+      caller=code_writer_assistant,  # The assistant agent can suggest calls to the calculator.
+      executor=code_writer_assistant,  # The user proxy agent can execute the calculator calls.
+      name="get_react_components_list",  # By default, the function name is used as the tool name.
+      description="Get the list of custom ReactJS components",  # A description of the tool.
+  )
+
+  register_function(
+      get_react_component,
+      caller=code_writer_assistant,  # The assistant agent can suggest calls to the calculator.
+      executor=code_writer_assistant,  # The user proxy agent can execute the calculator calls.
+      name="get_react_component",  # By default, the function name is used as the tool name.
+      description="Get the JS contents of a given ReactJS component you need to investigate",  # A description of the tool.
+  )
+
+  user = autogen.UserProxyAgent(
+      name="User",
+      human_input_mode="NEVER",
+      is_termination_msg=lambda x: x.get("content", "") and x.get("content", "").rstrip().endswith("TERMINATE"),
+      code_execution_config=False,
+  )
+
+  groupchat = autogen.GroupChat(agents=[user, code_writer_assistant, code_reviewer_assistant, response_writer_assistant], messages=[], max_round=10)
+  manager = autogen.GroupChatManager(groupchat=groupchat, llm_config=llm_config)
+
+  app = create_app()
+  app.run(debug=True)
