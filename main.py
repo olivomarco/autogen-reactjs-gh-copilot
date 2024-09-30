@@ -8,6 +8,11 @@ import time
 import json
 from pydantic import BaseModel
 from typing import Union, Optional
+import base64
+import requests
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.serialization import load_pem_public_key
 
 
 class ReactComponentList(BaseModel):
@@ -175,6 +180,66 @@ def generate(llm_response):
     yield f"data: {json.dumps(endObject)}\n\ndata: [DONE]\n\n"
 
 
+def verify_request(raw_body, signature, public_key_pem):
+    """Verify the request payload with the provided public key and signature"""
+    try:
+        # Decode the signature from base64
+        signature = base64.b64decode(signature)
+
+        # Load the public key
+        public_key = load_pem_public_key(public_key_pem.encode())
+
+        # Verify the signature based on key type
+        if isinstance(public_key, ec.EllipticCurvePublicKey):
+            # EC key verification
+            public_key.verify(
+                signature,
+                raw_body.encode(),
+                ec.ECDSA(hashes.SHA256())
+            )
+        else:
+            raise ValueError("Unsupported key type")
+
+        return True
+    except Exception as e:
+        print(f"Verification failed: {e}")
+        return False
+
+
+def fetch_verification_keys(token=""):
+    """Fetch the public keys from GitHub"""
+    headers = {}
+    if token:
+        headers['Authorization'] = f"token {token}"
+
+    response = requests.get("https://api.github.com/meta/public_keys/copilot_api", headers=headers)
+
+    if response.status_code == 200:
+        # Parse the response and return the keys
+        return response.json().get('public_keys', [])
+    else:
+        raise Exception(f"Failed to fetch keys: {response.status_code}")
+
+
+def verify_request_by_key_id(raw_body, signature, key_id, token=""):
+    """Fetch the public key matching the key identifier and verify the request"""
+    # Fetch all public keys
+    public_keys = fetch_verification_keys(token)
+
+    # Find the matching key by key_id
+    public_key = next((key for key in public_keys if key["key_identifier"] == key_id), None)
+
+    if not public_key:
+        raise Exception(f"No public key found matching key identifier: {key_id}")
+
+    # Verify the request using the matching public key
+    public_key_pem = public_key['key']
+    is_valid = verify_request(raw_body, signature, public_key_pem)
+
+    return is_valid
+
+
+
 # Capture the last message from code_writer_assistant before TERMINATE
 def get_final_code_writer_message(messages):
     for message in reversed(messages):
@@ -200,9 +265,6 @@ def get_final_response_writer_message(messages):
 
 def get_react_components_list() -> Union[str, ReactComponentList]:
     # retrieve list of all reactjs components
-    # use the belle/src/components folder and return a list of all js files inside it
-
-    # get all files in the folder
     files = glob.glob(f"{BASE_FOLDER}/*")
     # remove the path from the file name
     files = [os.path.basename(f) for f in files]
@@ -213,7 +275,6 @@ def get_react_components_list() -> Union[str, ReactComponentList]:
 
 def get_react_component(component_name: str) -> Optional[str]:
     # retrieve code for the given ReactJS component
-    # use the belle/src/components folder and return the content of the js file with the given name+
     print(f"Getting React component: {component_name}")
     if not os.path.exists(f"{BASE_FOLDER}/{component_name}/{component_name}.js"):
         return None
@@ -231,7 +292,7 @@ code_writer_assistant = autogen.ConversableAgent(
     system_message="You are an assistant that analyzes HTML code and creates a new ReactJS app that renders the HTML code."
                     "First, call get_react_components_list() to get the list of all custom ReactJS components you are allowed to use that are provided by the 'custom_abc' ReactJS components library."
                     "Then, call get_react_component(component_name) to get the code for a specific component you want to use to analyze it, and see if it is the right component to use in your context."
-                    "Finally, output the code for the new ReactJS app you created using these components, along with CSS if needed."
+                    "Finally, output the code for the new ReactJS app you created using these components, along with CSS if needed. Format in Markdown format with code (HTML, CSS, JSX, others) that is idented with a tab."
                     "Reply \"TERMINATE\" in the end when everything is done."
 )
 
@@ -240,7 +301,7 @@ code_reviewer_assistant = autogen.ConversableAgent(
     llm_config=llm_config,
     system_message="You are an assistant that reviews the code written by the code_writer_assistant."
                     "You should analyze the code and provide feedback to the assistant on how to improve it. Remember that the provided 'custom_abc' library must be used by the code writer assistant for the components."
-                    "Make sure components included by code_writer_assistant are not allucinated."
+                    "Make sure components included by code_writer_assistant are not hallucinated."
                     "You can also suggest changes to the code if necessary, taking in consideration that the output ReactJS code (and CSS if provided) must render exactly as the input HTML code."
                     "Only reply 'TERMINATE' if the code that the code_writer_assistant provides is fully satisfactory after your feedback and corrections have been implemented."
 )
@@ -250,7 +311,7 @@ response_writer_assistant = autogen.ConversableAgent(
     llm_config=llm_config,
     system_message="Develop a response using code provided by code_writer_assistant once it has been reviewed and approved by code_reviewer_assistant. Your response will go in a chat with a user."
                     "Do not address the user directly. Start naturally, and do not show that you are a bot. Do not respond with input code again, just with output code that "
-                    "the user needs to develop the React component and with instructions. Always start with 'Code follows:' and then provide the code. Enclose code into triple backticks as per Markdown spec."
+                    "the user needs to develop the React component and with instructions. Format in Markdown format with code (HTML, CSS, JSX, others) that is idented with a tab."
                     "Reply \"TERMINATE\" in the end when everything is done."
 )
 
@@ -284,11 +345,29 @@ def create_app():
     app = Flask(__name__)
 
     @app.route('/', methods=['POST'])
-    def home():
+    def copilot_generate():
+        # verify signatures
+        raw_body = request.data.decode()
+        signature = request.headers.get("Github-Public-Key-Signature", "")
+        key_id = request.headers.get("Github-Public-Key-Identifier", "")
+        token = request.headers.get("X-Github-Token", "")
+
+        try:
+            is_valid = verify_request_by_key_id(raw_body, signature, key_id, token)
+            if is_valid:
+                print("Request is valid.")
+            else:
+                return Response("Request is invalid.")
+        except Exception as e:
+            print(f"Error: {e}")
+            return Response(f"Error: {e}.")
+
         data = json.loads(request.data)
-        if data['messages'][-1]['copilot_references'] is None:
-            return Response(generate("CSS code:\n\n\n/* pricing.css */\n\n.pricing-card-title {\nfont-weight: bold;\n}"), mimetype='text/event-stream')
-            return Response(generate("Please pass some input HTML code"), mimetype='text/event-stream')
+        if data['messages'][-1]['content'] is not None and data['messages'][-1]['content'] != "":
+            copilot_content = data['messages'][-1]['content']
+        elif data['messages'][-1]['copilot_references'] is None or data not in data['messages'][-1]['copilot_references']:
+            #return Response(generate("Please pass **some** input HTML code.\n\n\t/*pricing*/\t\n.princing \{\}\n\n\t<html><body>\n\t<p>echo \"hello <b>world</b>\"</p>\n\t</body>\n\t</html>\n"), mimetype='text/event-stream')
+            return Response(generate("Please pass some input HTML code."), mimetype='text/event-stream')
         else:
             copilot_content = data['messages'][-1]['copilot_references'][0]['data']['content']
 
