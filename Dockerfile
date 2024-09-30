@@ -17,7 +17,7 @@ RUN pip install -r requirements.txt
 COPY custom_library_src/ ./custom_library_src/
 
 # Copy the rest of the application code
-COPY main.py .
+COPY main.py verify_signatures.py .
 
 # (Optional) Expose a port if your app runs a server, e.g., 8000
 EXPOSE 8000
