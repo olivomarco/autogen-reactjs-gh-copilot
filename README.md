@@ -15,9 +15,7 @@ Pass it some HTML code as command or highlight some HTML code and invoke the ext
 
 ## Deploying the application to Azure Container Apps
 
-First, you have to create an ```OAI_CONFIG_LIST``` file in the main directory with your details.
-
-**NOTE/DISCLAIMER**: this is bad practice, since the secret file will be embeded in the container image. This is just for demonstration purposes.
+To deploy, first you have to create an ```OAI_CONFIG_LIST``` file in the main directory with your Azure OpenAI resource details.
 
 If you want to deploy the application to Azure Container Apps, you can use the following script as a starting point:
 
